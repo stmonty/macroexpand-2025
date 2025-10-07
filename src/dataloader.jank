@@ -73,8 +73,6 @@ private:
 
 } // namespace jank::dl")
 
-;; Thin wrappers which keep the C++ semantics but make the DataLoader usable from Jank.
-
 (defn data-loader
   "Allocate a new `jank::dl::DataLoader` and return it boxed."
   [{:keys [data-dir batch-size block-size]}]
