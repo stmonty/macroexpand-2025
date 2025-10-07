@@ -1,0 +1,348 @@
+(require 'dataloader)
+(require 'model)
+
+(cpp/raw "#include <torch/torch.h>
+#include <string>
+#include <vector>
+#include <map>
+#include <filesystem>
+#include <iostream>
+#include <cmath>
+#include <limits>
+
+namespace jank { namespace model { struct GPTImpl; struct GPT; struct GPTConfig; } }
+namespace jank { namespace dl    { class DataLoader; } }
+
+namespace jank::app {
+
+// -----------------------------
+// config with defaults
+// -----------------------------
+struct AppConfig {
+  std::string mode        = \"train\";     // \"train\" | \"sample\"
+  std::string device      = \"cpu\";       // \"cpu\" | \"cuda\" | \"mps\"
+  int   batch_size        = 12;
+  int   block_size        = 64;
+  int   max_iters         = 2000;
+  int   lr_decay_iters    = 2000;
+  int   eval_interval     = 250;
+  int   eval_iters        = 20;
+  double learning_rate    = 1e-3;
+  int   warmup_iters      = 100;
+  double min_lr           = 1e-4;
+  double dropout          = 0.0;
+  int   n_layer           = 4;
+  int   n_head            = 4;
+  int   n_embd            = 128;
+  std::string out_dir     = \"out-shakespeare-char-cpp\";
+  std::string data_dir    = \"data/shakespeare_char\";
+  // sampling
+  std::string start_prompt = \"\\n\";
+  int   num_samples        = 5;
+  int   max_new_tokens     = 100;
+};
+
+// -----------------------------
+// small helpers (C++ side)
+// -----------------------------
+inline torch::Device choose_device(const std::string& d) {
+  if (d == \"cuda\" && torch::cuda::is_available()) {
+    std::cout << \"CUDA is available! Using CUDA.\" << std::endl;
+    return torch::Device(torch::kCUDA);
+  }
+  #ifdef TORCH_MPS_ENABLED
+  if (d == \"mps\" && torch::mps::is_available()) {
+    std::cout << \"MPS is available! Using Metal Performance Shaders.\" << std::endl;
+    return torch::Device(torch::kMPS);
+  }
+  #endif
+  std::cout << \"Using CPU.\" << std::endl;
+  return torch::Device(torch::kCPU);
+}
+
+inline double cosine_lr(int iter, int warmup_iters, int lr_decay_iters,
+                        double learning_rate, double min_lr) {
+  if (iter < warmup_iters)
+    return learning_rate * ((iter + 1.0) / (warmup_iters + 1.0));
+  if (iter > lr_decay_iters)
+    return min_lr;
+  const double decay_ratio = double(iter - warmup_iters) / double(lr_decay_iters - warmup_iters);
+  const double PI = 3.14159265358979323846;
+  const double coeff = 0.5 * (1.0 + std::cos(PI * decay_ratio));
+  return min_lr + coeff * (learning_rate - min_lr);
+}
+
+inline void set_lr(torch::optim::Optimizer& opt, double lr) {
+  for (auto& pg : opt.param_groups()) {
+    auto& opts = static_cast<torch::optim::AdamWOptions&>(pg.options());
+    opts.lr(lr);
+  }
+}
+
+inline torch::Tensor estimate_loss(jank::model::GPT& model,
+                                   jank::dl::DataLoader& loader,
+                                   torch::Device device, int eval_iters) {
+  model->eval();
+  torch::NoGradGuard ng;
+  auto losses = torch::zeros({eval_iters});
+  for (int k = 0; k < eval_iters; ++k) {
+    auto batch = loader.get_batch(\"val\");
+    auto X = batch.first.to(device);
+    auto Y = batch.second.to(device);
+    auto fw = model->forward(X, Y);
+    auto loss = fw.second;
+    losses[k] = loss.item<double>();
+  }
+  model->train();
+  return losses.mean();
+}
+
+// build a GPTConfig from AppConfig
+inline jank::model::GPTConfig make_gpt_config(const AppConfig& a);
+
+// -----------------------------
+// train & sample entrypoints
+// -----------------------------
+inline void train_with(const AppConfig& a) {
+  if (!a.out_dir.empty()) std::filesystem::create_directory(a.out_dir);
+
+  auto device = choose_device(a.device);
+  auto cfg    = make_gpt_config(a);
+
+  jank::model::GPT model(cfg);
+  model->to(device);
+
+  torch::optim::AdamW opt(model->parameters(),
+                          torch::optim::AdamWOptions(a.learning_rate).betas({0.9, 0.99}));
+
+  jank::dl::DataLoader loader(a.data_dir, a.batch_size, a.block_size);
+
+  for (int iter = 0; iter <= a.max_iters; ++iter) {
+    const double lr = cosine_lr(iter, a.warmup_iters, a.lr_decay_iters, a.learning_rate, a.min_lr);
+    set_lr(opt, lr);
+
+    auto pair = loader.get_batch(\"train\");
+    auto X = pair.first.to(device);
+    auto Y = pair.second.to(device);
+
+    auto fw = model->forward(X, Y);
+    auto loss = fw.second;
+
+    opt.zero_grad();
+    loss.backward();
+    opt.step();
+
+    if (iter > 0 && iter % a.eval_interval == 0) {
+      auto val_loss = estimate_loss(model, loader, device, a.eval_iters);
+      std::cout << \"Step \" << iter << \": Val loss \" << val_loss.item<float>()
+                << \" | LR: \" << lr << std::endl;
+      if (!a.out_dir.empty())
+        torch::save(model, a.out_dir + \"/ckpt.pt\");
+    }
+  }
+}
+
+inline std::string sample_with(const AppConfig& a) {
+  auto device = choose_device(a.device);
+  auto cfg    = make_gpt_config(a);
+
+  jank::model::GPT model(cfg);
+  const std::string checkpoint_path = a.out_dir + \"/ckpt.pt\";
+  try {
+    std::cout << \"Attempting to load checkpoint from: \" << checkpoint_path << std::endl;
+    torch::load(model, checkpoint_path, device);
+  } catch (const c10::Error& e) {
+    std::cerr << \"\\n--------------------------------------------------\\n\";
+    std::cerr << \"FATAL: Error loading model checkpoint.\\n\";
+    std::cerr << \"  File path: \" << checkpoint_path << \"\\n\";
+    std::cerr << \"  Error message: \" << e.what() << \"\\n\";
+    std::cerr << \"--------------------------------------------------\\n\";
+    throw;
+  }
+  model->to(device);
+  model->eval();
+
+  const std::string chars = \" \\n!$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz\";
+  std::map<char,int> stoi; std::map<int,char> itos;
+  for (size_t i = 0; i < chars.size(); ++i) { stoi[chars[i]] = int(i); itos[int(i)] = chars[i]; }
+
+  std::vector<int64_t> start_ids;
+  for (char c : a.start_prompt) start_ids.push_back(stoi[c]);
+  auto x = torch::tensor(start_ids, torch::kLong).view({1, (long)start_ids.size()}).to(device);
+
+  std::ostringstream os;
+  torch::NoGradGuard ng;
+  for (int k = 0; k < a.num_samples; ++k) {
+    auto y = model->generate(x, a.max_new_tokens);
+    os << \"---------------\\n\";
+    for (int i = 0; i < y.size(1); ++i) os << itos[y[0][i].item<int64_t>()];
+    os << '\\n';
+  }
+  return os.str();
+}
+
+// convenience: use defaults directly
+inline AppConfig defaults() { return AppConfig{}; }
+inline void      train()    { train_with(defaults()); }
+inline std::string sample() { return sample_with(defaults()); }
+
+// -----------------------------
+// impl of make_gpt_config
+// -----------------------------
+struct GPTConfig {
+  int block_size = 256;
+  int vocab_size = 65;
+  int n_layer = 6;
+  int n_head = 6;
+  int n_embd = 384;
+  double dropout = 0.2;
+  bool bias = false;
+};
+
+inline jank::model::GPTConfig make_gpt_config(const AppConfig& a) {
+  jank::model::GPTConfig cfg;
+  cfg.block_size = a.block_size;
+  cfg.vocab_size = 65; // fixed for shakespeare_char
+  cfg.n_layer    = a.n_layer;
+  cfg.n_head     = a.n_head;
+  cfg.n_embd     = a.n_embd;
+  cfg.dropout    = a.dropout;
+  cfg.bias       = false;
+  return cfg;
+}
+
+} // namespace jank::app
+")
+
+;; Jank side helpers that stay close to the C++ semantics while keeping boxed pointers explicit.
+
+(def default-app-config
+  {:mode "train"
+   :device "cpu"
+   :batch-size 12
+   :block-size 64
+   :max-iters 2000
+   :lr-decay-iters 2000
+   :eval-interval 250
+   :eval-iters 20
+   :learning-rate 1e-3
+   :warmup-iters 100
+   :min-lr 1e-4
+   :dropout 0.0
+   :n-layer 4
+   :n-head 4
+   :n-embd 128
+   :out-dir "out-shakespeare-char-cpp"
+   :data-dir "data/shakespeare_char"
+   :start-prompt "\n"
+   :num-samples 5
+   :max-new-tokens 100})
+
+(defn- ->std-string [value]
+  (cpp/cast cpp/std.string value))
+
+(defn app-config
+  "Allocate an AppConfig on the heap, apply overrides, and return a boxed pointer."
+  ([]
+   (app-config {}))
+  ([overrides]
+   (let [opts (merge default-app-config overrides)
+         cfg (cpp/new cpp/jank.app.AppConfig)
+         cfg* (cpp/* cfg)]
+     (cpp/= (cpp/.-mode cfg*) (->std-string (:mode opts)))
+     (cpp/= (cpp/.-device cfg*) (->std-string (:device opts)))
+     (cpp/= (cpp/.-batch_size cfg*) (cpp/int. (:batch-size opts)))
+     (cpp/= (cpp/.-block_size cfg*) (cpp/int. (:block-size opts)))
+     (cpp/= (cpp/.-max_iters cfg*) (cpp/int. (:max-iters opts)))
+     (cpp/= (cpp/.-lr_decay_iters cfg*) (cpp/int. (:lr-decay-iters opts)))
+     (cpp/= (cpp/.-eval_interval cfg*) (cpp/int. (:eval-interval opts)))
+     (cpp/= (cpp/.-eval_iters cfg*) (cpp/int. (:eval-iters opts)))
+     (cpp/= (cpp/.-learning_rate cfg*) (cpp/double. (:learning-rate opts)))
+     (cpp/= (cpp/.-warmup_iters cfg*) (cpp/int. (:warmup-iters opts)))
+     (cpp/= (cpp/.-min_lr cfg*) (cpp/double. (:min-lr opts)))
+     (cpp/= (cpp/.-dropout cfg*) (cpp/double. (:dropout opts)))
+     (cpp/= (cpp/.-n_layer cfg*) (cpp/int. (:n-layer opts)))
+     (cpp/= (cpp/.-n_head cfg*) (cpp/int. (:n-head opts)))
+     (cpp/= (cpp/.-n_embd cfg*) (cpp/int. (:n-embd opts)))
+     (cpp/= (cpp/.-out_dir cfg*) (->std-string (:out-dir opts)))
+     (cpp/= (cpp/.-data_dir cfg*) (->std-string (:data-dir opts)))
+     (cpp/= (cpp/.-start_prompt cfg*) (->std-string (:start-prompt opts)))
+     (cpp/= (cpp/.-num_samples cfg*) (cpp/int. (:num-samples opts)))
+     (cpp/= (cpp/.-max_new_tokens cfg*) (cpp/int. (:max-new-tokens opts)))
+     (cpp/box cfg))))
+
+(defn config->map [cfg]
+  (let [ptr (cpp/unbox (cpp/type "jank::app::AppConfig*") cfg)
+        c (cpp/* ptr)]
+    {:mode (cpp/.-mode c)
+     :device (cpp/.-device c)
+     :batch-size (cpp/.-batch_size c)
+     :block-size (cpp/.-block_size c)
+     :max-iters (cpp/.-max_iters c)
+     :lr-decay-iters (cpp/.-lr_decay_iters c)
+     :eval-interval (cpp/.-eval_interval c)
+     :eval-iters (cpp/.-eval_iters c)
+     :learning-rate (cpp/.-learning_rate c)
+     :warmup-iters (cpp/.-warmup_iters c)
+     :min-lr (cpp/.-min_lr c)
+     :dropout (cpp/.-dropout c)
+     :n-layer (cpp/.-n_layer c)
+     :n-head (cpp/.-n_head c)
+     :n-embd (cpp/.-n_embd c)
+     :out-dir (cpp/.-out_dir c)
+     :data-dir (cpp/.-data_dir c)
+     :start-prompt (cpp/.-start_prompt c)
+     :num-samples (cpp/.-num_samples c)
+     :max-new-tokens (cpp/.-max_new_tokens c)}))
+
+(defn defaults
+  "Box the default AppConfig from the C++ side."
+  []
+  (let [cfg (cpp/new cpp/jank.app.AppConfig (cpp/jank.app.defaults()))]
+    (cpp/box cfg)))
+
+(defn free-config [cfg]
+  (let [ptr (cpp/unbox (cpp/type "jank::app::AppConfig*") cfg)]
+    (cpp/delete ptr)
+    nil))
+
+(defn train!
+  "Invoke the C++ training entry point with either a boxed AppConfig or a map of overrides."
+  ([] (cpp/jank.app.train))
+  ([cfg-or-overrides]
+   (let [cfg (if (map? cfg-or-overrides)
+               (app-config cfg-or-overrides)
+               cfg-or-overrides)
+         ptr (cpp/unbox (cpp/type "jank::app::AppConfig*") cfg)]
+     (cpp/jank.app.train_with (cpp/* ptr))
+     (when (map? cfg-or-overrides)
+       (free-config cfg)))))
+
+(defn sample!
+  "Run sampling and return the generated text as a Jank string."
+  ([] (cpp/jank.app.sample))
+  ([cfg-or-overrides]
+   (let [cfg (if (map? cfg-or-overrides)
+               (app-config cfg-or-overrides)
+               cfg-or-overrides)
+         ptr (cpp/unbox (cpp/type "jank::app::AppConfig*") cfg)
+         result (cpp/jank.app.sample_with (cpp/* ptr))]
+     (when (map? cfg-or-overrides)
+       (free-config cfg))
+     result)))
+
+(defn run!
+  "Dispatch to train! or sample! based on the :mode field of the config."
+  ([] (train!))
+  ([cfg-or-overrides]
+   (if (map? cfg-or-overrides)
+     (let [mode (:mode cfg-or-overrides "train")]
+       (if (= mode "sample")
+         (sample! cfg-or-overrides)
+         (train! cfg-or-overrides)))
+     (let [ptr (cpp/unbox (cpp/type "jank::app::AppConfig*") cfg-or-overrides)
+           cfg (cpp/* ptr)
+           mode (cpp/.-mode cfg)]
+       (if (= mode "sample")
+         (sample! cfg-or-overrides)
+         (train! cfg-or-overrides))))))

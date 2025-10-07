@@ -1,0 +1,395 @@
+;; ./build/jank -I/home/monty/learning/libtorch/libtorch/include -I/home/monty/learning/libtorch/libtorch/include/torch/csrc/api/include -l/home/monty/learning/libtorch/libtorch/lib/libtorch.so run --module-path=scripts/nanogpt/ scripts/nanogpt/model.jank
+
+(cpp/raw "#include <torch/torch.h>
+#include <vector>
+#include <string>
+#include <iostream>
+#include <algorithm>
+#include <limits>
+#include <cmath>
+
+namespace jank::model {
+
+// ------------------------------
+// Config
+// ------------------------------
+struct GPTConfig {
+    int block_size = 256;
+    int vocab_size = 65;
+    int n_layer = 6;
+    int n_head = 6;
+    int n_embd = 384;
+    double dropout = 0.2;
+    bool bias = false;
+};
+
+// ------------------------------
+// LayerNorm
+// ------------------------------
+struct LayerNormImpl final : torch::nn::Module {
+    LayerNormImpl(int ndim, bool bias_enabled) {
+        weight = register_parameter(\"weight\", torch::ones(ndim));
+        if (bias_enabled) {
+            bias = register_parameter(\"bias\", torch::zeros(ndim));
+        }
+    }
+
+    torch::Tensor forward(const torch::Tensor &input) const {
+        using torch::nn::functional::LayerNormFuncOptions;
+        return torch::nn::functional::layer_norm(
+            input,
+            LayerNormFuncOptions({input.size(-1)}).weight(weight).bias(bias).eps(1e-5));
+    }
+
+    torch::Tensor weight;
+    torch::Tensor bias; // may be undefined if bias_enabled == false
+};
+TORCH_MODULE(LayerNorm);
+
+// ------------------------------
+// Causal Self-Attention
+// ------------------------------
+struct CausalSelfAttentionImpl final : torch::nn::Module {
+    explicit CausalSelfAttentionImpl(const GPTConfig &config)
+        : c_attn(torch::nn::LinearOptions(config.n_embd, 3 * config.n_embd).bias(config.bias)),
+          c_proj(torch::nn::LinearOptions(config.n_embd, config.n_embd).bias(config.bias)),
+          attn_dropout(torch::nn::DropoutOptions(config.dropout)),
+          resid_dropout(torch::nn::DropoutOptions(config.dropout)),
+          n_head(config.n_head),
+          n_embd(config.n_embd),
+          dropout(config.dropout) {
+
+        register_module(\"c_attn\", c_attn);
+        register_module(\"c_proj\", c_proj);
+        register_module(\"attn_dropout\", attn_dropout);
+        register_module(\"resid_dropout\", resid_dropout);
+
+        flash = false; // keep simple/portable
+
+        if (!flash) {
+            std::cout << \"WARNING: Using slow attention implementation.\" << std::endl;
+            // lower-triangular causal mask buffer
+            this->bias = torch::tril(torch::ones({config.block_size, config.block_size}))
+                           .view({1, 1, config.block_size, config.block_size});
+            register_buffer(\"bias\", this->bias);
+        }
+    }
+
+    torch::Tensor forward(const torch::Tensor &x) {
+        auto B = x.size(0);
+        auto T = x.size(1);
+        auto C = x.size(2);
+
+        auto qkv   = c_attn->forward(x);
+        auto parts = qkv.split(n_embd, 2);
+        auto q = parts[0];
+        auto k = parts[1];
+        auto v = parts[2];
+
+        q = q.view({B, T, n_head, C / n_head}).transpose(1, 2);
+        k = k.view({B, T, n_head, C / n_head}).transpose(1, 2);
+        v = v.view({B, T, n_head, C / n_head}).transpose(1, 2);
+
+        torch::Tensor y;
+        if (flash) {
+            // omitted
+        } else {
+            auto att = (q.matmul(k.transpose(-2, -1))) * (1.0 / std::sqrt((double)k.size(-1)));
+            att = att.masked_fill(bias.slice(2, 0, T).slice(3, 0, T) == 0,
+                                  -std::numeric_limits<float>::infinity());
+            att = torch::nn::functional::softmax(att, -1);
+            att = attn_dropout->forward(att);
+            y   = att.matmul(v);
+        }
+
+        y = y.transpose(1, 2).contiguous().view({B, T, C});
+        y = resid_dropout->forward(c_proj->forward(y));
+        return y;
+    }
+
+    torch::nn::Linear c_attn{nullptr}, c_proj{nullptr};
+    torch::nn::Dropout attn_dropout{nullptr}, resid_dropout{nullptr};
+    int n_head, n_embd;
+    double dropout;
+    bool flash;
+    torch::Tensor bias; // causal mask
+};
+TORCH_MODULE(CausalSelfAttention);
+
+// ------------------------------
+// MLP
+// ------------------------------
+struct MLPImpl final : torch::nn::Module {
+    explicit MLPImpl(const GPTConfig &config)
+        : c_fc(torch::nn::LinearOptions(config.n_embd, 4 * config.n_embd).bias(config.bias)),
+          c_proj(torch::nn::LinearOptions(4 * config.n_embd, config.n_embd).bias(config.bias)),
+          dropout(torch::nn::DropoutOptions(config.dropout)) {
+        register_module(\"c_fc\", c_fc);
+        register_module(\"c_proj\", c_proj);
+        register_module(\"dropout\", dropout);
+    }
+
+    torch::Tensor forward(torch::Tensor x) {
+        x = c_fc->forward(x);
+        // gelu with approximate=\"tanh\" (explicit options object)
+        x = torch::nn::functional::gelu(x, torch::nn::functional::GELUFuncOptions().approximate(\"tanh\"));
+        x = c_proj->forward(x);
+        x = dropout->forward(x);
+        return x;
+    }
+
+    torch::nn::Linear c_fc{nullptr}, c_proj{nullptr};
+    torch::nn::Dropout dropout{nullptr};
+};
+TORCH_MODULE(MLP);
+
+// ------------------------------
+// Transformer Block
+// ------------------------------
+struct BlockImpl final : torch::nn::Module {
+    explicit BlockImpl(const GPTConfig &config)
+        : ln_1(config.n_embd, config.bias),
+          ln_2(config.n_embd, config.bias),
+          attn(config),
+          mlp(config) {
+        register_module(\"ln_1\", ln_1);
+        register_module(\"attn\", attn);
+        register_module(\"ln_2\", ln_2);
+        register_module(\"mlp\", mlp);
+    }
+
+    torch::Tensor forward(torch::Tensor x) {
+        x = x + attn->forward(ln_1->forward(x));
+        x = x + mlp->forward(ln_2->forward(x));
+        return x;
+    }
+
+    LayerNorm ln_1{nullptr}, ln_2{nullptr};
+    CausalSelfAttention attn{nullptr};
+    MLP mlp{nullptr};
+};
+TORCH_MODULE(Block);
+
+// ------------------------------
+// GPT
+// ------------------------------
+struct GPTImpl final : torch::nn::Module {
+    explicit GPTImpl(const GPTConfig &config)
+        : config(config),
+          wte(torch::nn::EmbeddingOptions(config.vocab_size, config.n_embd)),
+          wpe(torch::nn::EmbeddingOptions(config.block_size, config.n_embd)),
+          drop(torch::nn::DropoutOptions(config.dropout)),
+          h(torch::nn::ModuleList()),
+          ln_f(config.n_embd, config.bias),
+          lm_head(torch::nn::LinearOptions(config.n_embd, config.vocab_size).bias(false)) {
+
+        register_module(\"wte\", wte);
+        register_module(\"wpe\", wpe);
+        register_module(\"drop\", drop);
+        for (int i = 0; i < config.n_layer; ++i) {
+            h->push_back(Block(config));
+        }
+        register_module(\"h\", h);
+        register_module(\"ln_f\", ln_f);
+        register_module(\"lm_head\", lm_head);
+
+        // Weight tying: share storage between embedding and lm_head
+        lm_head->weight = wte->weight;
+
+        // Init
+        this->apply([this](torch::nn::Module &m) { this->_init_weights(m); });
+    }
+
+    std::pair<torch::Tensor, torch::Tensor>
+    forward(const torch::Tensor &idx, const torch::Tensor &targets = torch::Tensor()) {
+        auto device = idx.device();
+        auto t = idx.size(1);
+
+        TORCH_CHECK(t <= config.block_size,
+                    \"Cannot forward sequence of length \", t,
+                    \", block size is only \", config.block_size);
+
+        auto pos = torch::arange(0, t, torch::TensorOptions().dtype(torch::kLong).device(device));
+        auto tok_emb = wte->forward(idx);
+        auto pos_emb = wpe->forward(pos);
+        auto x = drop->forward(tok_emb + pos_emb);
+
+        for (const auto &blk : *h) {
+            x = blk->as<BlockImpl>()->forward(x);
+        }
+        x = ln_f->forward(x);
+
+        torch::Tensor logits, loss;
+        if (targets.defined()) {
+            logits = lm_head->forward(x);
+            loss = torch::nn::functional::cross_entropy(
+                logits.view({-1, logits.size(-1)}),
+                targets.view(-1),
+                torch::nn::functional::CrossEntropyFuncOptions().ignore_index(-1));
+        } else {
+            // take only last time step for inference
+            auto last = x.index({torch::indexing::Slice(),
+                                 torch::indexing::Slice(-1, torch::indexing::None)});
+            logits = lm_head->forward(last);
+            loss = torch::Tensor();
+        }
+        return {logits, loss};
+    }
+
+    void _init_weights(torch::nn::Module &module) const {
+        if (const auto *linear = module.as<torch::nn::Linear>()) {
+            torch::nn::init::normal_(linear->weight, 0.0, 0.02);
+            if (linear->bias.defined()) {
+                torch::nn::init::zeros_(linear->bias);
+            }
+        } else if (const auto *embedding = module.as<torch::nn::Embedding>()) {
+            torch::nn::init::normal_(embedding->weight, 0.0, 0.02);
+        }
+
+        // special init for proj weights
+        for (auto &p : this->named_parameters()) {
+            if (p.key().find(\"c_proj.weight\") != std::string::npos) {
+                torch::nn::init::normal_(p.value(), 0.0, 0.02 / std::sqrt(2.0 * config.n_layer));
+            }
+        }
+    }
+
+    torch::Tensor generate(torch::Tensor idx, int max_new_tokens,
+                           double temperature = 1.0, int top_k = -1) {
+        for (int i = 0; i < max_new_tokens; ++i) {
+            // condition sequence to last block_size tokens
+            auto T = idx.size(1);
+            auto idx_cond = (T <= config.block_size) ? idx
+                           : idx.index({torch::indexing::Slice(),
+                                        torch::indexing::Slice(T - config.block_size, T)});
+            auto out = this->forward(idx_cond);
+            auto logits = out.first;              // [B, 1, vocab]
+            // select last timestep robustly
+            logits = logits.select(1, logits.size(1) - 1) / temperature; // [B, vocab]
+
+            if (top_k > 0) {
+                auto k = std::min<int64_t>(top_k, logits.size(-1));
+                auto topk = torch::topk(logits, k);
+                auto vals = std::get<0>(topk).select(1, k - 1); // kth largest threshold
+                logits = logits.masked_fill(logits < vals.unsqueeze(1), -std::numeric_limits<float>::infinity());
+            }
+
+            auto probs = torch::nn::functional::softmax(logits, -1);
+            auto idx_next = torch::multinomial(probs, 1);      // [B,1]
+            idx = torch::cat({idx, idx_next}, 1);              // append
+        }
+        return idx;
+    }
+
+    GPTConfig config;
+    torch::nn::Embedding wte{nullptr}, wpe{nullptr};
+    torch::nn::Dropout drop{nullptr};
+    torch::nn::ModuleList h{nullptr};
+    LayerNorm ln_f{nullptr};
+    torch::nn::Linear lm_head{nullptr};
+};
+TORCH_MODULE(GPT);
+
+inline jank::model::GPT* new_gpt_from_config(const jank::model::GPTConfig* cfg) {
+    return new jank::model::GPT(*cfg);
+}
+
+inline void delete_gpt(jank::model::GPT* ptr) {
+    delete ptr;
+}
+
+} // namespace jank::model
+")
+
+;; Interop helpers to construct and use the GPT module without leaving Jank.
+(def default-config
+  {:block-size 256
+   :vocab-size 65
+   :n-layer 6
+   :n-head 6
+   :n-embd 384
+   :dropout 0.2
+   :bias false})
+
+(defn gpt-config
+  ([]
+   (gpt-config {}))
+  ([overrides]
+   (let [opts (merge default-config overrides)
+         {:keys [block-size vocab-size n-layer n-head n-embd dropout bias]} opts
+         cfg (cpp/new cpp/jank.model.GPTConfig)
+         cfg* (cpp/* cfg)]
+     (cpp/= (cpp/.-block_size cfg*) (cpp/int. block-size))
+     (cpp/= (cpp/.-vocab_size cfg*) (cpp/int. vocab-size))
+     (cpp/= (cpp/.-n_layer cfg*) (cpp/int. n-layer))
+     (cpp/= (cpp/.-n_head cfg*) (cpp/int. n-head))
+     (cpp/= (cpp/.-n_embd cfg*) (cpp/int. n-embd))
+     (cpp/= (cpp/.-dropout cfg*) (cpp/double. dropout))
+     (if bias
+       (cpp/= (cpp/.-bias cfg*) (cpp/value "true"))
+       (cpp/= (cpp/.-bias cfg*) (cpp/value "false")))
+     (cpp/box cfg))))
+
+(defn config->map [cfg]
+  (cond
+    (map? cfg) (merge default-config cfg)
+    :else (let [ptr (cpp/unbox (cpp/type "jank::model::GPTConfig*") cfg)
+                cfg* (cpp/* ptr)]
+            {:block-size (cpp/.-block_size cfg*)
+             :vocab-size (cpp/.-vocab_size cfg*)
+             :n-layer (cpp/.-n_layer cfg*)
+             :n-head (cpp/.-n_head cfg*)
+             :n-embd (cpp/.-n_embd cfg*)
+             :dropout (cpp/.-dropout cfg*)
+             :bias (cpp/.-bias cfg*)})))
+
+(defn gpt
+  ([]
+   (gpt {}))
+  ([config-or-overrides]
+   (let [boxed (cond
+                 (nil? config-or-overrides) (gpt-config {})
+                 (map? config-or-overrides) (gpt-config config-or-overrides)
+                 :else config-or-overrides)
+         ptr (cpp/unbox (cpp/type "jank::model::GPTConfig*") boxed)
+         model (cpp/jank.model.new_gpt_from_config ptr)]
+     (cpp/box model))))
+
+(defn free-config [cfg]
+  (let [ptr (cpp/unbox (cpp/type "jank::model::GPTConfig*") cfg)]
+    (cpp/delete ptr)
+    nil))
+
+(defn free-model [model]
+  (let [ptr (cpp/unbox (cpp/type "jank::model::GPT*") model)]
+    (cpp/jank.model.delete_gpt ptr)
+    nil))
+
+(defn forward
+  ([model idx]
+   (forward model idx nil))
+  ([model idx targets]
+   (let [ptr (cpp/unbox (cpp/type "jank::model::GPT*") model)
+         holder (cpp/* ptr)
+         result (if (some? targets)
+                  (cpp/.forward holder idx targets)
+                  (cpp/.forward holder idx))
+         logits (cpp/.-first result)
+         loss (cpp/.-second result)]
+     {:logits logits
+      :loss loss})))
+
+(defn generate
+  ([model idx max-new-tokens]
+   (let [ptr (cpp/unbox (cpp/type "jank::model::GPT*") model)
+         holder (cpp/* ptr)]
+     (cpp/.generate holder idx (cpp/int. max-new-tokens))))
+  ([model idx max-new-tokens {:keys [temperature top-k]
+                              :or {temperature 1.0
+                                   top-k -1}}]
+   (let [ptr (cpp/unbox (cpp/type "jank::model::GPT*") model)
+         holder (cpp/* ptr)]
+     (cpp/.generate holder idx
+                    (cpp/int. max-new-tokens)
+                    (cpp/double. temperature)
+                    (cpp/int. top-k)))))

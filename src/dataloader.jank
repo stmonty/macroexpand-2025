@@ -1,0 +1,100 @@
+(cpp/raw "#include <torch/torch.h>
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <fstream>
+#include <stdexcept>
+#include <iostream>
+
+namespace jank::dl {
+
+class DataLoader {
+public:
+    DataLoader(const std::string& data_dir, int batch_size, int block_size)
+        : batch_size_(batch_size), block_size_(block_size) {
+        load_tokens(data_dir + \"/train.bin\", train_data_);
+        load_tokens(data_dir + \"/val.bin\",   val_data_);
+        std::cout << \"Train data loaded, \" << train_data_.size(0) << \" tokens.\\n\";
+        std::cout << \"Val data loaded,   \" << val_data_.size(0)   << \" tokens.\\n\";
+        if (train_data_.size(0) <= block_size_ || val_data_.size(0) <= block_size_) {
+            throw std::runtime_error(\"block_size is larger than dataset length\");
+        }
+    }
+
+    std::pair<torch::Tensor, torch::Tensor> get_batch(const std::string& split) {
+        const auto& data = (split == \"train\") ? train_data_ : val_data_;
+        // high is exclusive, keeps y slice in-bounds
+        auto ix = torch::randint(/*high=*/data.size(0) - block_size_, {batch_size_}, torch::kLong);
+
+        std::vector<torch::Tensor> xs;
+        std::vector<torch::Tensor> ys;
+        xs.reserve(batch_size_);
+        ys.reserve(batch_size_);
+
+        for (int i = 0; i < batch_size_; ++i) {
+            const auto start = ix[i].item<int64_t>();
+            xs.emplace_back(data.index({torch::indexing::Slice(start, start + block_size_)}));
+            ys.emplace_back(data.index({torch::indexing::Slice(start + 1, start + 1 + block_size_)}));
+        }
+        auto x = torch::stack(xs, 0);
+        auto y = torch::stack(ys, 0);
+        return {x, y};
+    }
+
+private:
+    static void load_tokens(const std::string& path, torch::Tensor& out) {
+        std::ifstream file(path, std::ios::binary);
+        if (!file) {
+            throw std::runtime_error(std::string(\"Error opening file: \") + path);
+        }
+        file.seekg(0, std::ios::end);
+        const std::streamsize nbytes = file.tellg();
+        file.seekg(0, std::ios::beg);
+
+        if (nbytes % static_cast<std::streamsize>(sizeof(uint16_t)) != 0) {
+            throw std::runtime_error(\"File size is not a multiple of 2 bytes: \" + path);
+        }
+        std::vector<uint16_t> tokens(static_cast<size_t>(nbytes) / sizeof(uint16_t));
+        file.read(reinterpret_cast<char*>(tokens.data()), nbytes);
+
+        // from_blob doesn't own memory; clone() so the Tensor owns it
+        out = torch::from_blob(tokens.data(),
+                               {static_cast<long>(tokens.size())},
+                               torch::TensorOptions().dtype(torch::kUInt16))
+                 .to(torch::kLong)
+                 .clone();
+    }
+
+    int batch_size_;
+    int block_size_;
+    torch::Tensor train_data_;
+    torch::Tensor val_data_;
+};
+
+} // namespace jank::dl")
+
+;; Thin wrappers which keep the C++ semantics but make the DataLoader usable from Jank.
+
+(defn data-loader
+  "Allocate a new `jank::dl::DataLoader` and return it boxed."
+  [{:keys [data-dir batch-size block-size]}]
+  (let [loader (cpp/new cpp/jank.dl.DataLoader
+                        (cpp/cast cpp/std.string data-dir)
+                        (cpp/int. batch-size)
+                        (cpp/int. block-size))]
+    (cpp/box loader)))
+
+(defn get-batch
+  "Fetch a batch from the boxed DataLoader pointer. Returns a map with :x and :y tensors."
+  [loader split]
+  (let [ptr (cpp/unbox (cpp/type "jank::dl::DataLoader*") loader)
+        pair (cpp/.get_batch (cpp/* ptr) (cpp/cast cpp/std.string split))]
+    {:x (cpp/.-first pair)
+     :y (cpp/.-second pair)}))
+
+(defn free
+  "Destroy a boxed DataLoader pointer allocated via `data-loader`."
+  [loader]
+  (let [ptr (cpp/unbox (cpp/type "jank::dl::DataLoader*") loader)]
+    (cpp/delete ptr)
+    nil))
