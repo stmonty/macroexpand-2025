@@ -301,7 +301,6 @@ inline void delete_gpt(jank::model::GPT* ptr) {
 } // namespace jank::model
 ")
 
-;; Interop helpers to construct and use the GPT module without leaving Jank.
 (def default-config
   {:block-size 256
    :vocab-size 65

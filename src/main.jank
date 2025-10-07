@@ -214,8 +214,6 @@ inline jank::model::GPTConfig make_gpt_config(const AppConfig& a) {
 } // namespace jank::app
 ")
 
-;; Jank side helpers that stay close to the C++ semantics while keeping boxed pointers explicit.
-
 (def default-app-config
   {:mode "train"
    :device "cpu"
