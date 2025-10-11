@@ -14,7 +14,10 @@ python data/shakespeare_char/prepare.py
 To get the data for training.
 
 ### Running
-Note: Point the include and linker flags to wherever you have libtorch installed.
-```
-jank -I/libtorch/include -I/libtorch/libtorch/include/torch/csrc/api/include -l/libtorch/libtorch/lib/libtorch.so run --module-path=src/ src/main.jank
+
+Note: Update the `LIBTORCH_INSTALL_DIR` variable in the `Makefile` to point to
+the libtorch installation directory.
+
+```shell
+make run
 ```

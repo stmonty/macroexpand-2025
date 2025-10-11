@@ -1,0 +1,14 @@
+LIBTORCH_INSTALL_DIR=$(shell pwd)/third-party/pytorch/libtorch_install_cpp20_debug
+LIBTORCH_FLAGS=-I"${LIBTORCH_INSTALL_DIR}/include" -I"${LIBTORCH_INSTALL_DIR}/include/torch/csrc/api/include" -l"${LIBTORCH_INSTALL_DIR}/lib/libtorch.dylib"
+
+debug:
+	lldb -- jank ${LIBTORCH_FLAGS}
+
+repl:
+	jank ${LIBTORCH_FLAGS} repl
+
+run:
+	jank ${LIBTORCH_FLAGS} run --module-path=src/ src/main.jank
+
+.PHONY: repl run test test-setup
+
