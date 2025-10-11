@@ -10,5 +10,8 @@ repl:
 run:
 	jank ${LIBTORCH_FLAGS} run --module-path=src/ src/main.jank
 
+test-setup:
+	jank ${LIBTORCH_FLAGS} run --module-path=raw/ raw/main.jank
+
 .PHONY: repl run test test-setup
 
