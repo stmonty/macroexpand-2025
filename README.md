@@ -1,5 +1,6 @@
 # macroexpand-2025
 
+This repo is a reproduction of [Jianling](https://github.com/jianlingzhong)'s [C++ port](https://github.com/jianlingzhong/nanoGPT-cpp) of Andrej Karpathy's phenomenal [nanoGPT](https://github.com/karpathy/nanoGPT) using jank's seamless C++ interop.
 
 ## Build Instructions
 
