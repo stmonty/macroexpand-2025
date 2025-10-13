@@ -1,0 +1,6 @@
+[submodule "third-party/cpp"]
+	path = third-party/cpp
+	url = https://github.com/jianlingzhong/nanoGPT-cpp.git
+[submodule "third-party/python"]
+	path = third-party/python
+	url = https://github.com/karpathy/nanoGPT
