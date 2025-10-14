@@ -1,5 +1,6 @@
 # macroexpand-2025
 
+This repo is a reproduction of [Jianling](https://github.com/jianlingzhong)'s [C++ port](https://github.com/jianlingzhong/nanoGPT-cpp) of Andrej Karpathy's phenomenal [nanoGPT](https://github.com/karpathy/nanoGPT) using jank's seamless C++ interop.
 
 ## Build Instructions
 
@@ -13,8 +14,21 @@ python data/shakespeare_char/prepare.py
 ```
 To get the data for training.
 
-### Running
-Note: Point the include and linker flags to wherever you have libtorch installed.
+> Note:
+> 1. Install instructions for libtorch can be found
+>    [here](https://github.com/shantanu-sardesai/macroexpand-2025?tab=readme-ov-file#pytorch).
+> 2. Update the `LIBTORCH_INSTALL_DIR` variable in the `Makefile` to point to
+>    the libtorch installation directory.
+
+#### Test the setup
+
+```shell
+make test-setup
 ```
-jank -I/libtorch/include -I/libtorch/libtorch/include/torch/csrc/api/include -l/libtorch/libtorch/lib/libtorch.so run --module-path=src/ src/main.jank
+
+### Running
+
+
+```shell
+make run
 ```
