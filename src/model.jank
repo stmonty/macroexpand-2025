@@ -368,15 +368,19 @@ inline void delete_gpt(jank::model::GPT* ptr) {
   ([model idx]
    (forward model idx nil))
   ([model idx targets]
-   (let [ptr (cpp/unbox (cpp/type "jank::model::GPT*") model)
-         holder (cpp/* ptr)
+   ;; TODO: Switch to the alias created using `TORCH_MODULE`.
+   (let [model' (cpp/unbox (cpp/type "jank::model::GPTImpl*") model)
+         idx' (->> idx (cpp/unbox (cpp/type "torch::Tensor*")) cpp/*)
+         targets' (->> targets(cpp/unbox (cpp/type "torch::Tensor*")) cpp/*)
+         ; FIXME: https://github.com/jank-lang/jank/issues/544
          result (if (some? targets)
-                  (cpp/.forward holder idx targets)
-                  (cpp/.forward holder idx))
-         logits (cpp/.-first result)
-         loss (cpp/.-second result)]
-     {:logits logits
-      :loss loss})))
+                  (-> (cpp/.forward model' idx' targets') cpp/& cpp/box)
+                  (-> (cpp/.forward model' idx') cpp/& cpp/box))
+         result' (cpp/unbox (cpp/type "std::pair<torch::Tensor, torch::Tensor>*") result)
+         logits (cpp/.-first result')
+         loss (cpp/.-second result')]
+     {:loss (cpp/box (cpp/& loss))
+      :logits (cpp/box (cpp/& logits))})))
 
 (defn generate
   ([model idx max-new-tokens]
