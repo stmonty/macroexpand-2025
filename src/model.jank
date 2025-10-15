@@ -1,5 +1,3 @@
-;; ./build/jank -I/home/monty/learning/libtorch/libtorch/include -I/home/monty/learning/libtorch/libtorch/include/torch/csrc/api/include -l/home/monty/learning/libtorch/libtorch/lib/libtorch.so run --module-path=scripts/nanogpt/ scripts/nanogpt/model.jank
-
 (cpp/raw "#include <torch/torch.h>
 #include <vector>
 #include <string>
