@@ -473,7 +473,8 @@ inline decltype(auto) call_cat(torch::Tensor idx, at::Tensor idx_next) {
                 _ (when (cpp/> top-k' (cpp/int 0))
                     (let [topk (cpp/value "&torch::topk")
                           topk-res (topk logits' (cpp/std.min (cpp/cast cpp/int64_t top-k') (cpp/.size logits' (cpp/int64_t -1))) (cpp/int64_t -1) cpp/true cpp/true)
-                          topk-vals (cpp/first topk-res)]
+                          topk-vals logits' ; (cpp/first topk-res) ;; FIXME: https://github.com/jank-lang/jank/issues/552
+                          ]
                       (cpp/.masked_fill_ logits' (cpp/< logits' (cpp/.slice topk-vals (cpp/int64_t 1) (cpp/int64_t -1))) (cpp/value "-std::numeric_limits<float>::infinity()"))
                       nil))
                 probs (cpp/torch.nn.functional.softmax logits' (cpp/int -1))
