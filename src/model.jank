@@ -441,3 +441,45 @@ inline decltype(auto) call_forward(auto module, auto x) {
    (let [model' (cpp/unbox (cpp/type "jank::model::GPTImpl*") model)
          idx' (->> idx (cpp/unbox (cpp/type "torch::Tensor*")) cpp/*)]
      (-> (cpp/.generate model' idx' max-new-tokens temperature top-k) cpp/& cpp/box))))
+
+(cpp/raw "
+inline decltype(auto) first(auto p) {
+  return std::get<0>(p);
+}
+")
+
+(cpp/raw "
+inline decltype(auto) call_cat(torch::Tensor idx, at::Tensor idx_next) {
+  return torch::cat({idx, idx_next}, 1);
+}
+")
+
+(defn generate [model idx max-new-tokens {:keys [temperature top-k]
+                                          :or {temperature 1.0
+                                               top-k -1}}]
+    (let [model' (cpp/unbox (cpp/type "jank::model::GPTImpl*") model)
+          top-k' (cpp/cast cpp/int top-k)]
+      (loop [i 0
+             idx idx]
+        (if (< i max-new-tokens)
+          (let [idx' (->> idx (cpp/unbox (cpp/type "torch::Tensor*")) cpp/*)
+                t (cpp/.size idx' (cpp/int 1))
+                size (-> model' cpp/.-config cpp/.-block_size)
+                idx'' (if (cpp/<= t size) (cpp/cast cpp/at.Tensor idx') (cpp/.slice idx' (cpp/int64_t 1) (cpp/- t size)))
+                out (->> (forward (cpp/box model') (cpp/box (cpp/& idx''))) (cpp/unbox (cpp/type "std::pair<torch::Tensor, torch::Tensor>*")) cpp/*)
+                logits (cpp/first out)
+                squeeze (-> (cpp/.slice logits (cpp/int64_t 1) (cpp/int64_t -1)) (cpp/.squeeze (cpp/int64_t 1)))
+                logits' (cpp// squeeze (cpp/cast cpp/double temperature))
+                _ (when (cpp/> top-k' (cpp/int 0))
+                    (let [topk (cpp/value "&torch::topk")
+                          topk-res (topk logits' (cpp/std.min (cpp/cast cpp/int64_t top-k') (cpp/.size logits' (cpp/int64_t -1))) (cpp/int64_t -1) cpp/true cpp/true)
+                          topk-vals (cpp/first topk-res)]
+                      (cpp/.masked_fill_ logits' (cpp/< logits' (cpp/.slice topk-vals (cpp/int64_t 1) (cpp/int64_t -1))) (cpp/value "-std::numeric_limits<float>::infinity()"))
+                      nil))
+                probs (cpp/torch.nn.functional.softmax logits' (cpp/int -1))
+                multinomial (cpp/value "&torch::multinomial")
+                idx''' (multinomial probs (cpp/int64_t 1) cpp/false cpp/std.nullopt)
+                idx'''' (cpp/call_cat idx' idx''')]
+            (recur (inc i) (-> idx'''' cpp/& cpp/box)))
+          idx))))
+
