@@ -237,9 +237,6 @@ inline jank::model::GPTConfig make_gpt_config(const AppConfig& a) {
    :num-samples 5
    :max-new-tokens 100})
 
-(defn- ->std-string [value]
-  (cpp/cast cpp/std.string value))
-
 (defn app-config
   "Allocate an AppConfig on the heap, apply overrides, and return a boxed pointer."
   ([]
@@ -248,26 +245,26 @@ inline jank::model::GPTConfig make_gpt_config(const AppConfig& a) {
    (let [opts (merge default-app-config overrides)
          cfg (cpp/new cpp/jank.app.AppConfig)
          cfg* (cpp/* cfg)]
-     (cpp/= (cpp/.-mode cfg*) (->std-string (:mode opts)))
-     (cpp/= (cpp/.-device cfg*) (->std-string (:device opts)))
-     (cpp/= (cpp/.-batch_size cfg*) (cpp/int. (:batch-size opts)))
-     (cpp/= (cpp/.-block_size cfg*) (cpp/int. (:block-size opts)))
-     (cpp/= (cpp/.-max_iters cfg*) (cpp/int. (:max-iters opts)))
-     (cpp/= (cpp/.-lr_decay_iters cfg*) (cpp/int. (:lr-decay-iters opts)))
-     (cpp/= (cpp/.-eval_interval cfg*) (cpp/int. (:eval-interval opts)))
-     (cpp/= (cpp/.-eval_iters cfg*) (cpp/int. (:eval-iters opts)))
-     (cpp/= (cpp/.-learning_rate cfg*) (cpp/double. (:learning-rate opts)))
-     (cpp/= (cpp/.-warmup_iters cfg*) (cpp/int. (:warmup-iters opts)))
-     (cpp/= (cpp/.-min_lr cfg*) (cpp/double. (:min-lr opts)))
-     (cpp/= (cpp/.-dropout cfg*) (cpp/double. (:dropout opts)))
-     (cpp/= (cpp/.-n_layer cfg*) (cpp/int. (:n-layer opts)))
-     (cpp/= (cpp/.-n_head cfg*) (cpp/int. (:n-head opts)))
-     (cpp/= (cpp/.-n_embd cfg*) (cpp/int. (:n-embd opts)))
-     (cpp/= (cpp/.-out_dir cfg*) (->std-string (:out-dir opts)))
-     (cpp/= (cpp/.-data_dir cfg*) (->std-string (:data-dir opts)))
-     (cpp/= (cpp/.-start_prompt cfg*) (->std-string (:start-prompt opts)))
-     (cpp/= (cpp/.-num_samples cfg*) (cpp/int. (:num-samples opts)))
-     (cpp/= (cpp/.-max_new_tokens cfg*) (cpp/int. (:max-new-tokens opts)))
+     (cpp/= (cpp/.-mode cfg*) (cpp/cast cpp/std.string (:mode opts)))
+     (cpp/= (cpp/.-device cfg*) (cpp/cast cpp/std.string (:device opts)))
+     (cpp/= (cpp/.-batch_size cfg*) (cpp/int (:batch-size opts)))
+     (cpp/= (cpp/.-block_size cfg*) (cpp/int (:block-size opts)))
+     (cpp/= (cpp/.-max_iters cfg*) (cpp/int (:max-iters opts)))
+     (cpp/= (cpp/.-lr_decay_iters cfg*) (cpp/int (:lr-decay-iters opts)))
+     (cpp/= (cpp/.-eval_interval cfg*) (cpp/int (:eval-interval opts)))
+     (cpp/= (cpp/.-eval_iters cfg*) (cpp/int (:eval-iters opts)))
+     (cpp/= (cpp/.-learning_rate cfg*) (cpp/double (:learning-rate opts)))
+     (cpp/= (cpp/.-warmup_iters cfg*) (cpp/int (:warmup-iters opts)))
+     (cpp/= (cpp/.-min_lr cfg*) (cpp/double (:min-lr opts)))
+     (cpp/= (cpp/.-dropout cfg*) (cpp/double (:dropout opts)))
+     (cpp/= (cpp/.-n_layer cfg*) (cpp/int (:n-layer opts)))
+     (cpp/= (cpp/.-n_head cfg*) (cpp/int (:n-head opts)))
+     (cpp/= (cpp/.-n_embd cfg*) (cpp/int (:n-embd opts)))
+     (cpp/= (cpp/.-out_dir cfg*) (cpp/cast cpp/std.string (:out-dir opts)))
+     (cpp/= (cpp/.-data_dir cfg*) (cpp/cast cpp/std.string (:data-dir opts)))
+     (cpp/= (cpp/.-start_prompt cfg*) (cpp/cast cpp/std.string (:start-prompt opts)))
+     (cpp/= (cpp/.-num_samples cfg*) (cpp/int (:num-samples opts)))
+     (cpp/= (cpp/.-max_new_tokens cfg*) (cpp/int (:max-new-tokens opts)))
      (cpp/box cfg))))
 
 (defn config->map [cfg]
@@ -293,12 +290,6 @@ inline jank::model::GPTConfig make_gpt_config(const AppConfig& a) {
      :start-prompt (cpp/.-start_prompt c)
      :num-samples (cpp/.-num_samples c)
      :max-new-tokens (cpp/.-max_new_tokens c)}))
-
-(defn defaults
-  "Box the default AppConfig from the C++ side."
-  []
-  (let [cfg (cpp/new cpp/jank.app.AppConfig (cpp/jank.app.defaults()))]
-    (cpp/box cfg)))
 
 (defn free-config [cfg]
   (let [ptr (cpp/unbox (cpp/type "jank::app::AppConfig*") cfg)]
@@ -346,6 +337,10 @@ inline jank::model::GPTConfig make_gpt_config(const AppConfig& a) {
          (sample! cfg-or-overrides)
          (train! cfg-or-overrides))))))
 
+(run!)
+
 (defn -main [& args]
-  )
+  (let [args (rest args)
+        args (->> args (partition 2) (map vec) (into {}))]
+    (run!)))
 
