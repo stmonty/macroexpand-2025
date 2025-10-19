@@ -1,5 +1,6 @@
-(require 'dataloader)
-(require 'model)
+(ns nanogpt.core
+  (:require [nanogpt.dataloader :as dl]
+            [nanogpt.model :as model]))
 
 (cpp/raw "#include <torch/torch.h>
 #include <string>
@@ -344,3 +345,7 @@ inline jank::model::GPTConfig make_gpt_config(const AppConfig& a) {
        (if (= mode "sample")
          (sample! cfg-or-overrides)
          (train! cfg-or-overrides))))))
+
+(defn -main [& args]
+  )
+
