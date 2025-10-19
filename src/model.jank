@@ -362,22 +362,6 @@ inline void delete_gpt(jank::model::GPT* ptr) {
     (cpp/jank.model.delete_gpt ptr)
     nil))
 
-(defn forward
-  ([model idx]
-   (forward model idx nil))
-  ([model idx targets]
-   ;; TODO: Switch to the alias created using `TORCH_MODULE`.
-   (let [model' (cpp/unbox (cpp/type "jank::model::GPTImpl*") model)
-         idx' (->> idx (cpp/unbox (cpp/type "torch::Tensor*")) cpp/*)
-         targets' (->> targets(cpp/unbox (cpp/type "torch::Tensor*")) cpp/*)
-         result (if (some? targets)
-                  (cpp/.forward model' idx' targets')
-                  (cpp/.forward model' idx'))
-         logits (cpp/.-first result)
-         loss (cpp/.-second result)]
-     {:loss (cpp/box (cpp/& loss))
-      :logits (cpp/box (cpp/& logits))})))
-
 (cpp/raw "
 inline decltype(auto) call_forward(auto module, auto x) {
   return module->template as<jank::model::BlockImpl>()->forward(x);
@@ -429,18 +413,6 @@ inline decltype(auto) call_forward(auto module, auto x) {
                 ((cpp/type "torch::Tensor")))]
      {:logits (-> logits cpp/& cpp/box)
       :loss (-> loss cpp/& cpp/box)})))
-
-(defn generate
-  ([model idx max-new-tokens]
-   (let [model' (cpp/unbox (cpp/type "jank::model::GPTImpl*") model)
-         idx' (->> idx (cpp/unbox (cpp/type "torch::Tensor*")) cpp/*)]
-     (-> (cpp/.generate model' idx' (cpp/int. max-new-tokens)) cpp/& cpp/box)))
-  ([model idx max-new-tokens {:keys [temperature top-k]
-                              :or {temperature 1.0
-                                   top-k -1}}]
-   (let [model' (cpp/unbox (cpp/type "jank::model::GPTImpl*") model)
-         idx' (->> idx (cpp/unbox (cpp/type "torch::Tensor*")) cpp/*)]
-     (-> (cpp/.generate model' idx' max-new-tokens temperature top-k) cpp/& cpp/box))))
 
 (cpp/raw "
 inline decltype(auto) first(auto p) {
