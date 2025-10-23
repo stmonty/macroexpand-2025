@@ -1,6 +1,6 @@
 (ns nanogpt.core
   (:require [nanogpt.dataloader :as dl]
-            [nanogpt.model :as model]))
+            [nanogpt.model :as m]))
 
 (cpp/raw "#include <torch/torch.h>
 #include <string>
@@ -10,9 +10,6 @@
 #include <iostream>
 #include <cmath>
 #include <limits>
-
-namespace jank { namespace model { struct GPTImpl; struct GPT; struct GPTConfig; } }
-namespace jank { namespace dl    { class DataLoader; } }
 
 namespace jank::app {
 
@@ -215,6 +212,42 @@ inline jank::model::GPTConfig make_gpt_config(const AppConfig& a) {
 } // namespace jank::app
 ")
 
+(comment
+  :info "Constructor resolution fails.")
+(cpp/raw "
+torch::Device create_device(auto type) {
+  return torch::Device(type);
+}
+")
+
+(defn pick-device [device-config]
+  (let [cuda? #(and (= device-config :cuda) (cpp/torch.cuda.is_available))
+        mps? #(and (= device-config :mps) (cpp/torch.mps.is_available))
+        type (cond
+                 (cuda?) (do
+                           (println "CUDA is available! Using CUDA.")
+                           (cpp/value "torch::kCUDA"))
+                 (mps?) (do
+                         (println "MPS is available! Using metal Performance shaders.")
+                         (cpp/value "torch::kMPS"))
+                 :else (do
+                         (println "Using CPU.")
+                         (cpp/value "torch::kCPU")))]
+    ; FIXME: input_line_140:3:10: error: no matching conversion for functional-style cast from 'jank::runtime::object *' to 'torch::Device'
+    ; (->> type cpp/create_device cpp/& cpp/box)
+    ))
+
+; (defn cosine-lr [iter warmup-iters lr-decay-iters lr min-lr]
+;   (cond (< iter warmup-iters) (* lr (/ (+ iter 1.0) (+ warmup-iters 1.0)))
+;         (< iter lr-decay-iters) min-lr
+;         :else (let [decay-ratio (/ (- iter warmup-iters) (- lr-decay-iters warmup-iters))
+;                     pi 3.14159265358979323846
+;                     coeff (* 0.5 (+ 1.0 (cpp/std.cos (cpp/* (cpp/double pi) (cpp/double decay-ratio)))))])))
+
+(defn set-lr [opt lr]
+  (let [opt' (->> opt (cpp/unbox cpp/torch.optim.Optimizer*) cpp/*)
+        ]))
+
 (def default-app-config
   {:mode "train"
    :device "cpu"
@@ -296,15 +329,72 @@ inline jank::model::GPTConfig make_gpt_config(const AppConfig& a) {
     (cpp/delete ptr)
     nil))
 
+(cpp/raw "
+jank::model::GPT* make_gpt_model(jank::model::GPTConfig& config) {
+  return new jank::model::GPT(config);
+}
+")
+
+(cpp/raw "
+inline decltype(auto) get_item(auto loss) {
+  return loss.template item<float>();
+}
+")
+
+(defn train-with [cfg]
+  (let [cfg' (->> cfg (cpp/unbox cpp/jank.app.AppConfig*) cpp/*)
+        out-dir (cpp/.-out_dir cfg')
+        _ (if (cpp/.empty out-dir) (cpp/std.filesystem.create_directory out-dir))
+        device' (cpp/jank.app.choose_device (cpp/.-device cfg'))
+        gpt-cfg (cpp/jank.app.make_gpt_config cfg')
+        model' (-> gpt-cfg cpp/make_gpt_model)
+        _ (cpp/.to (cpp/.get model') device')
+        optim-opts (doto (cpp/torch.optim.AdamWOptions (cpp/.-learning_rate cfg'))
+                     (cpp/.betas (cpp/value "std::tuple<int, int>{0.9, 0.99}")))
+        opt' (cpp/torch.optim.AdamW (cpp/.parameters (cpp/.get model')) optim-opts)
+        model (-> model' cpp/box)
+        opt (-> opt' cpp/& cpp/box)
+        loader' (cpp/jank.dl.DataLoader (cpp/.-data_dir cfg') (cpp/.-batch_size cfg') (cpp/.-block_size cfg'))
+        loader (-> loader' cpp/& cpp/box)
+        device (-> device' cpp/& cpp/box)]
+    (doseq [iter (range (cpp/.-max_iters cfg'))]
+      (let [model' (->> model (cpp/unbox cpp/jank.model.GPT*) cpp/*)
+            cfg' (->> cfg (cpp/unbox cpp/jank.app.AppConfig*) cpp/*)
+            opt' (->> opt (cpp/unbox cpp/torch.optim.AdamW*) cpp/*)
+            loader' (->> loader (cpp/unbox cpp/jank.dl.DataLoader*) cpp/*)
+            device' (->> device (cpp/unbox (cpp/type "torch::Device*")) cpp/*)
+            lr (cpp/jank.app.cosine_lr (cpp/cast cpp/int iter) (cpp/.-warmup_iters cfg') (cpp/.-lr_decay_iters cfg') (cpp/.-learning_rate cfg') (cpp/.-min_lr cfg'))
+            _ (cpp/jank.app.set_lr opt' lr)
+            pair (cpp/.get_batch loader' (cpp/cast cpp/std.string "train"))
+            X' (-> pair cpp/.-first (cpp/.to device'))
+            Y' (-> pair cpp/.-second (cpp/.to device'))
+            X (-> X' cpp/& cpp/box)
+            Y (-> Y' cpp/& cpp/box)
+            fw (m/forward  model X Y)
+            loss (->> fw :loss (cpp/unbox cpp/at.Tensor*) cpp/*)]
+        (do
+          (cpp/.zero_grad opt')
+          (cpp/.backward loss)
+          (cpp/.step opt'))
+        (if (and (> iter 0)
+                   (= 0 (rem iter (int (cpp/.-eval_interval cfg')))))
+          (do
+            (cpp/<< cpp/std.cout (cpp/cast cpp/std.string (str "Step " iter
+                                                               ": Val loss " 0 ; (cpp/get_item )
+                                                               " | LR: " lr
+                                                              \newline)))
+            (if (-> cfg' cpp/.-out_dir cpp/.empty cpp/!)
+              (cpp/torch.save model' (cpp/+ (cpp/.-out_dir cfg') (cpp/cast cpp/std.string "/ckpt.pt"))))))))))
+
 (defn train!
   "Invoke the C++ training entry point with either a boxed AppConfig or a map of overrides."
-  ([] (cpp/jank.app.train))
+  ([] (train-with (-> (cpp/jank.app.defaults) cpp/& cpp/box)))
   ([cfg-or-overrides]
    (let [cfg (if (map? cfg-or-overrides)
                (app-config cfg-or-overrides)
                cfg-or-overrides)
          ptr (cpp/unbox (cpp/type "jank::app::AppConfig*") cfg)]
-     (cpp/jank.app.train_with (cpp/* ptr))
+     (train-with (-> ptr cpp/& cpp/box))
      (when (map? cfg-or-overrides)
        (free-config cfg)))))
 
@@ -337,10 +427,10 @@ inline jank::model::GPTConfig make_gpt_config(const AppConfig& a) {
          (sample! cfg-or-overrides)
          (train! cfg-or-overrides))))))
 
-(run!)
-
 (defn -main [& args]
   (let [args (rest args)
         args (->> args (partition 2) (map vec) (into {}))]
     (run!)))
+
+(-main)
 

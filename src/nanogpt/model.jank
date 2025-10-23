@@ -370,12 +370,36 @@ inline decltype(auto) call_forward(auto module, auto x) {
 }
 ")
 
+(comment
+  :info
+  "Had to use the raw C++ loop instead due to a potential UB at play
+
+  `Uncaught exception: invalid object type (expected opaque_box found unknown)`"
+  )
+(cpp/raw "
+inline torch::Tensor run_blocks(torch::Tensor &x, torch::nn::ModuleListImpl &h) {
+  auto y{x};
+
+  for (const auto &block_module: h) {
+    y = block_module->as<jank::model::BlockImpl>()->forward(y);
+  }
+
+  return y;
+}
+")
+
+(cpp/raw "
+inline at::Tensor tensor_view(torch::Tensor &logits) {
+  return logits.view({-1, logits.size(-1)});
+}
+")
+
 (defn forward
-  ([model idx] (forward model idx (-> ((cpp/type "torch::Tensor")) cpp/& cpp/box)))
+  ([model idx] (forward model idx (-> (cpp/torch.Tensor) cpp/& cpp/box)))
   ([model idx targets]
-   (let [model' (cpp/unbox (cpp/type "jank::model::GPTImpl*") model)
-         idx' (->> idx (cpp/unbox (cpp/type "torch::Tensor*")) cpp/*)
-         targets' (->> targets(cpp/unbox (cpp/type "torch::Tensor*")) cpp/*)
+   (let [model' (->> model (cpp/unbox cpp/jank.model.GPT*) cpp/* cpp/.get)
+         idx' (->> idx (cpp/unbox cpp/torch.Tensor*) cpp/*)
+         targets' (->> targets(cpp/unbox cpp/torch.Tensor*) cpp/*)
          device (cpp/.device idx')
          t (cpp/.size idx' (cpp/int 1))
          t-opts (doto ((cpp/type "torch::TensorOptions"))
@@ -388,15 +412,8 @@ inline decltype(auto) call_forward(auto module, auto x) {
          tok-emb (-> model' cpp/.-wte cpp/* (cpp/.forward idx'))
          pos-emb (-> model' cpp/.-wpe cpp/* (cpp/.forward pos))
          x (-> model' cpp/.-drop cpp/* (cpp/.forward (cpp/+ tok-emb pos-emb)))
-         it (-> model' cpp/.-h cpp/* cpp/.begin)
-         end (-> model' cpp/.-h cpp/* cpp/.end)
-         x' (loop [x (-> x cpp/& cpp/box)]
-             (when (cpp/! (cpp/== it end))
-               (let [block-module (cpp/* it)
-                     x' (->> x (cpp/unbox (cpp/type "torch::Tensor*")) cpp/*)]
-                 (cpp/++ it)
-                 (recur (-> (cpp/call_forward block-module x') cpp/& cpp/box)))))
-         x'' (->> x' (cpp/unbox (cpp/type "torch::Tensor*")) cpp/*)
+         h* (-> model' cpp/.-h cpp/*)
+         x'' (cpp/run_blocks x h*)
          x''' (-> model' cpp/.-ln_f cpp/* (cpp/.forward x''))
          targets? (cpp/.defined targets')
          logits (if targets?
@@ -406,13 +423,12 @@ inline decltype(auto) call_forward(auto module, auto x) {
                         last (cpp/.index x''' indices)]
                     (-> model' cpp/.-lm_head cpp/* (cpp/.forward last))))
          loss (if targets?
-                (let [size (cpp/at.IntArrayRef (cpp/& ((cpp/type "long long") -1)) (cpp/cast cpp/size_t (cpp/.size logits (cpp/int -1))))
-                      last-logit (cpp/.view logits size)
+                (let [last-logit (cpp/tensor_view logits)
                       last-target (cpp/.view targets' (cpp/int -1))
-                      opts (doto ((cpp/type "torch::nn::functional::CrossEntropyFuncOptions"))
+                      opts (doto (cpp/torch.nn.functional.CrossEntropyFuncOptions)
                                   (cpp/.ignore_index (cpp/int -1)))]
                   (cpp/torch.nn.functional.cross_entropy last-logit last-target opts))
-                ((cpp/type "torch::Tensor")))]
+                (cpp/torch.Tensor))]
      {:logits (-> logits cpp/& cpp/box)
       :loss (-> loss cpp/& cpp/box)})))
 
