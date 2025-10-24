@@ -336,7 +336,7 @@ jank::model::GPT* make_gpt_model(jank::model::GPTConfig& config) {
 ")
 
 (cpp/raw "
-inline decltype(auto) get_item(auto loss) {
+inline float get_item(torch::Tensor loss) {
   return loss.template item<float>();
 }
 ")
@@ -357,7 +357,7 @@ inline decltype(auto) get_item(auto loss) {
         loader' (cpp/jank.dl.DataLoader (cpp/.-data_dir cfg') (cpp/.-batch_size cfg') (cpp/.-block_size cfg'))
         loader (-> loader' cpp/& cpp/box)
         device (-> device' cpp/& cpp/box)]
-    (doseq [iter (range (cpp/.-max_iters cfg'))]
+    (doseq [iter (range (cpp/+ (cpp/int 1) (cpp/.-max_iters cfg')))]
       (let [model' (->> model (cpp/unbox cpp/jank.model.GPT*) cpp/*)
             cfg' (->> cfg (cpp/unbox cpp/jank.app.AppConfig*) cpp/*)
             opt' (->> opt (cpp/unbox cpp/torch.optim.AdamW*) cpp/*)
@@ -380,7 +380,7 @@ inline decltype(auto) get_item(auto loss) {
                    (= 0 (rem iter (int (cpp/.-eval_interval cfg')))))
           (do
             (cpp/<< cpp/std.cout (cpp/cast cpp/std.string (str "Step " iter
-                                                               ": Val loss " 0 ; (cpp/get_item )
+                                                               ": Val loss " (cpp/get_item (cpp/jank.app.estimate_loss model' loader' device' (cpp/.-eval_iters cfg')))
                                                                " | LR: " lr
                                                               \newline)))
             (if (-> cfg' cpp/.-out_dir cpp/.empty cpp/!)
