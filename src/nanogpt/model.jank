@@ -1,4 +1,4 @@
-;; ./build/jank -I/home/monty/learning/libtorch/libtorch/include -I/home/monty/learning/libtorch/libtorch/include/torch/csrc/api/include -l/home/monty/learning/libtorch/libtorch/lib/libtorch.so run --module-path=scripts/nanogpt/ scripts/nanogpt/model.jank
+(ns nanogpt.model)
 
 (cpp/raw "#include <torch/torch.h>
 #include <vector>
@@ -364,31 +364,112 @@ inline void delete_gpt(jank::model::GPT* ptr) {
     (cpp/jank.model.delete_gpt ptr)
     nil))
 
-(defn forward
-  ([model idx]
-   (forward model idx nil))
-  ([model idx targets]
-   (let [ptr (cpp/unbox (cpp/type "jank::model::GPT*") model)
-         holder (cpp/* ptr)
-         result (if (some? targets)
-                  (cpp/.forward holder idx targets)
-                  (cpp/.forward holder idx))
-         logits (cpp/.-first result)
-         loss (cpp/.-second result)]
-     {:logits logits
-      :loss loss})))
+(cpp/raw "
+inline decltype(auto) call_forward(auto module, auto x) {
+  return module->template as<jank::model::BlockImpl>()->forward(x);
+}
+")
 
-(defn generate
-  ([model idx max-new-tokens]
-   (let [ptr (cpp/unbox (cpp/type "jank::model::GPT*") model)
-         holder (cpp/* ptr)]
-     (cpp/.generate holder idx (cpp/int. max-new-tokens))))
-  ([model idx max-new-tokens {:keys [temperature top-k]
-                              :or {temperature 1.0
-                                   top-k -1}}]
-   (let [ptr (cpp/unbox (cpp/type "jank::model::GPT*") model)
-         holder (cpp/* ptr)]
-     (cpp/.generate holder idx
-                    (cpp/int. max-new-tokens)
-                    (cpp/double. temperature)
-                    (cpp/int. top-k)))))
+(comment
+  :info
+  "Had to use the raw C++ loop instead due to a potential UB at play
+
+  `Uncaught exception: invalid object type (expected opaque_box found unknown)`"
+  )
+(cpp/raw "
+inline torch::Tensor run_blocks(torch::Tensor &x, torch::nn::ModuleListImpl &h) {
+  auto y{x};
+
+  for (const auto &block_module: h) {
+    y = block_module->as<jank::model::BlockImpl>()->forward(y);
+  }
+
+  return y;
+}
+")
+
+(cpp/raw "
+inline at::Tensor tensor_view(torch::Tensor &logits) {
+  return logits.view({-1, logits.size(-1)});
+}
+")
+
+(defn forward
+  ([model idx] (forward model idx (-> (cpp/torch.Tensor) cpp/& cpp/box)))
+  ([model idx targets]
+   (let [model' (->> model (cpp/unbox cpp/jank.model.GPT*) cpp/* cpp/.get)
+         idx' (->> idx (cpp/unbox cpp/torch.Tensor*) cpp/*)
+         targets' (->> targets(cpp/unbox cpp/torch.Tensor*) cpp/*)
+         device (cpp/.device idx')
+         t (cpp/.size idx' (cpp/int 1))
+         t-opts (doto ((cpp/type "torch::TensorOptions"))
+                      ;; FIXME: `cpp/torch.kLong` doesn't work.
+                      (cpp/.dtype (cpp/value "torch::kLong"))
+                      ;; FIXME: Template instantiation fails here.
+                      ; (cpp/.device device)
+                      )
+         pos (cpp/torch.arange (cpp/int 0) t t-opts)
+         tok-emb (-> model' cpp/.-wte cpp/* (cpp/.forward idx'))
+         pos-emb (-> model' cpp/.-wpe cpp/* (cpp/.forward pos))
+         x (-> model' cpp/.-drop cpp/* (cpp/.forward (cpp/+ tok-emb pos-emb)))
+         h* (-> model' cpp/.-h cpp/*)
+         x'' (cpp/run_blocks x h*)
+         x''' (-> model' cpp/.-ln_f cpp/* (cpp/.forward x''))
+         targets? (cpp/.defined targets')
+         logits (if targets?
+                  (-> model' cpp/.-lm_head cpp/* (cpp/.forward x'''))
+                  ;; FIXME: Try to convert as much as possible into jank C++ interop.
+                  (let [indices (cpp/value "std::initializer_list<at::indexing::TensorIndex>{torch::indexing::Slice(), torch::indexing::Slice(-1, torch::indexing::None)}")
+                        last (cpp/.index x''' indices)]
+                    (-> model' cpp/.-lm_head cpp/* (cpp/.forward last))))
+         loss (if targets?
+                (let [last-logit (cpp/tensor_view logits)
+                      last-target (cpp/.view targets' (cpp/int -1))
+                      opts (doto (cpp/torch.nn.functional.CrossEntropyFuncOptions)
+                                  (cpp/.ignore_index (cpp/int -1)))]
+                  (cpp/torch.nn.functional.cross_entropy last-logit last-target opts))
+                (cpp/torch.Tensor))]
+     {:logits (-> logits cpp/& cpp/box)
+      :loss (-> loss cpp/& cpp/box)})))
+
+(cpp/raw "
+inline decltype(auto) first(auto p) {
+  return std::get<0>(p);
+}
+")
+
+(cpp/raw "
+inline decltype(auto) call_cat(torch::Tensor idx, at::Tensor idx_next) {
+  return torch::cat({idx, idx_next}, 1);
+}
+")
+
+(defn generate [model idx max-new-tokens {:keys [temperature top-k]
+                                          :or {temperature 1.0
+                                               top-k -1}}]
+    (let [model' (cpp/unbox (cpp/type "jank::model::GPTImpl*") model)
+          top-k' (cpp/cast cpp/int top-k)]
+      (loop [i 0
+             idx idx]
+        (if (< i max-new-tokens)
+          (let [idx' (->> idx (cpp/unbox (cpp/type "torch::Tensor*")) cpp/*)
+                t (cpp/.size idx' (cpp/int 1))
+                size (-> model' cpp/.-config cpp/.-block_size)
+                idx'' (if (cpp/<= t size) (cpp/cast cpp/at.Tensor idx') (cpp/.slice idx' (cpp/int64_t 1) (cpp/- t size)))
+                out (->> (forward (cpp/box model') (cpp/box (cpp/& idx''))) (cpp/unbox (cpp/type "std::pair<torch::Tensor, torch::Tensor>*")) cpp/*)
+                logits (cpp/first out)
+                squeeze (-> (cpp/.slice logits (cpp/int64_t 1) (cpp/int64_t -1)) (cpp/.squeeze (cpp/int64_t 1)))
+                logits' (cpp// squeeze (cpp/cast cpp/double temperature))
+                _ (when (cpp/> top-k' (cpp/int 0))
+                    (let [topk (cpp/value "&torch::topk")
+                          topk-res (topk logits' (cpp/std.min (cpp/cast cpp/int64_t top-k') (cpp/.size logits' (cpp/int64_t -1))) (cpp/int64_t -1) cpp/true cpp/true)
+                          topk-vals (cpp/first topk-res)]
+                      (cpp/.masked_fill_ logits' (cpp/< logits' (cpp/.slice topk-vals (cpp/int64_t 1) (cpp/int64_t -1))) (cpp/value "-std::numeric_limits<float>::infinity()"))
+                      nil))
+                probs (cpp/torch.nn.functional.softmax logits' (cpp/int -1))
+                multinomial (cpp/value "&torch::multinomial")
+                idx''' (multinomial probs (cpp/int64_t 1) cpp/false cpp/std.nullopt)
+                idx'''' (cpp/call_cat idx' idx''')]
+            (recur (inc i) (-> idx'''' cpp/& cpp/box)))
+          idx))))
+

@@ -1,3 +1,5 @@
+(ns nanogpt.dataloader)
+
 (cpp/raw "#include <torch/torch.h>
 #include <cstdint>
 #include <string>
@@ -78,17 +80,19 @@ private:
   [{:keys [data-dir batch-size block-size]}]
   (let [loader (cpp/new cpp/jank.dl.DataLoader
                         (cpp/cast cpp/std.string data-dir)
-                        (cpp/int. batch-size)
-                        (cpp/int. block-size))]
+                        (cpp/int batch-size)
+                        (cpp/int block-size))]
     (cpp/box loader)))
 
 (defn get-batch
   "Fetch a batch from the boxed DataLoader pointer. Returns a map with :x and :y tensors."
   [loader split]
-  (let [ptr (cpp/unbox (cpp/type "jank::dl::DataLoader*") loader)
-        pair (cpp/.get_batch (cpp/* ptr) (cpp/cast cpp/std.string split))]
-    {:x (cpp/.-first pair)
-     :y (cpp/.-second pair)}))
+  (let [loader' (->> loader (cpp/unbox (cpp/type "jank::dl::DataLoader*")) cpp/*)
+        pair (cpp/.get_batch loader' (cpp/cast cpp/std.string split))
+        x' (cpp/.-first pair)
+        y' (cpp/.-second pair)]
+    {:x (-> x' cpp/& cpp/box)
+     :y (-> y' cpp/& cpp/box)}))
 
 (defn free
   "Destroy a boxed DataLoader pointer allocated via `data-loader`."
