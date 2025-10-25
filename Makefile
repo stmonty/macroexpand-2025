@@ -5,7 +5,7 @@ debug:
 	lldb -- jank ${LIBTORCH_FLAGS}
 
 compile:
-	jank ${LIBTORCH_FLAGS} run --module-path=src/ ${FILE}
+	jank ${LIBTORCH_FLAGS} run --module-path=src/ ${FILE} ${ARGS}
 
 repl:
 	jank ${LIBTORCH_FLAGS} repl
