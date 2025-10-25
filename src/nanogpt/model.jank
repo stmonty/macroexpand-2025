@@ -394,6 +394,12 @@ inline at::Tensor tensor_view(torch::Tensor &logits) {
 }
 ")
 
+(cpp/raw "
+torch::TensorOptions set_device(torch::TensorOptions &options, c10::Device &device) {
+  return options.device(device);
+}
+")
+
 (defn forward
   ([model idx] (forward model idx (-> (cpp/torch.Tensor) cpp/& cpp/box)))
   ([model idx targets]
@@ -405,22 +411,23 @@ inline at::Tensor tensor_view(torch::Tensor &logits) {
          t-opts (doto ((cpp/type "torch::TensorOptions"))
                       ;; FIXME: `cpp/torch.kLong` doesn't work.
                       (cpp/.dtype (cpp/value "torch::kLong"))
+                      (cpp/set_device device)
                       ;; FIXME: Template instantiation fails here.
                       ; (cpp/.device device)
                       )
          pos (cpp/torch.arange (cpp/int 0) t t-opts)
          tok-emb (-> model' cpp/.-wte cpp/* (cpp/.forward idx'))
          pos-emb (-> model' cpp/.-wpe cpp/* (cpp/.forward pos))
-         x (-> model' cpp/.-drop cpp/* (cpp/.forward (cpp/+ tok-emb pos-emb)))
+         x' (-> model' cpp/.-drop cpp/* (cpp/.forward (cpp/+ tok-emb pos-emb)))
          h* (-> model' cpp/.-h cpp/*)
-         x'' (cpp/run_blocks x h*)
-         x''' (-> model' cpp/.-ln_f cpp/* (cpp/.forward x''))
+         x' (cpp/run_blocks x' h*)
+         x' (-> model' cpp/.-ln_f cpp/* (cpp/.forward x'))
          targets? (cpp/.defined targets')
          logits (if targets?
-                  (-> model' cpp/.-lm_head cpp/* (cpp/.forward x'''))
+                  (-> model' cpp/.-lm_head cpp/* (cpp/.forward x'))
                   ;; FIXME: Try to convert as much as possible into jank C++ interop.
                   (let [indices (cpp/value "std::initializer_list<at::indexing::TensorIndex>{torch::indexing::Slice(), torch::indexing::Slice(-1, torch::indexing::None)}")
-                        last (cpp/.index x''' indices)]
+                        last (cpp/.index x' indices)]
                     (-> model' cpp/.-lm_head cpp/* (cpp/.forward last))))
          loss (if targets?
                 (let [last-logit (cpp/tensor_view logits)
