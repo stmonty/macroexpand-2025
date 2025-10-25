@@ -394,6 +394,12 @@ inline at::Tensor tensor_view(torch::Tensor &logits) {
 }
 ")
 
+(cpp/raw "
+torch::TensorOptions set_device(torch::TensorOptions &options, c10::Device &device) {
+  return options.device(device);
+}
+")
+
 (defn forward
   ([model idx] (forward model idx (-> (cpp/torch.Tensor) cpp/& cpp/box)))
   ([model idx targets]
@@ -405,6 +411,7 @@ inline at::Tensor tensor_view(torch::Tensor &logits) {
          t-opts (doto ((cpp/type "torch::TensorOptions"))
                       ;; FIXME: `cpp/torch.kLong` doesn't work.
                       (cpp/.dtype (cpp/value "torch::kLong"))
+                      (cpp/set_device device)
                       ;; FIXME: Template instantiation fails here.
                       ; (cpp/.device device)
                       )
