@@ -11,7 +11,7 @@ repl:
 	jank ${LIBTORCH_FLAGS} repl
 
 run:
-	jank ${LIBTORCH_FLAGS} run --module-path=src/ src/main.jank
+	jank ${LIBTORCH_FLAGS} run --module-path=src/ src/nanogpt/core.jank
 
 test-setup:
 	jank ${LIBTORCH_FLAGS} run --module-path=raw/ raw/main.jank
